@@ -95,7 +95,27 @@ export class StringRevealer extends Transformation {
                                 wrapperFunctionSet.add(
                                     functionParent as NodePath<t.FunctionDeclaration>
                                 );
-                            } else if (
+                            } else if (self.isBasicStringArrayWrapperVariant(functionParent.node, arrayName)) {
+                                const body = (functionParent.node as any).body.body;
+                                // Find the "Index Shift" assignment expression
+                                const assignmentStatement = body.find((stmt: any) => 
+                                    t.isExpressionStatement(stmt) &&
+                                    t.isAssignmentExpression(stmt.expression, { operator: '=' }) &&
+                                    t.isBinaryExpression(stmt.expression.right, { operator: '-' })
+                                );
+                                const binaryExpression = assignmentStatement.expression.right;
+                                const absoluteOffset = binaryExpression.right.value;
+                                const offset = binaryExpression.operator == '+'
+                                    ? absoluteOffset
+                                    : -absoluteOffset;
+                                const decoder = new BasicStringDecoder(stringArray, offset);
+                                stringDecoders.push(decoder);
+
+                                wrapperFunctionSet.add(
+                                    functionParent as NodePath<t.FunctionDeclaration>
+                                );
+                            }
+                            else if (
                                 self.isComplexStringArrayWrapper(functionParent.node, arrayName)
                             ) {
                                 const offsetExpression = (functionParent.node as any).body.body[1]
@@ -423,6 +443,92 @@ export class StringRevealer extends Transformation {
             node.body.body[2].argument.arguments.length == 2 &&
             t.isIdentifier(node.body.body[2].argument.arguments[0]) &&
             t.isIdentifier(node.body.body[2].argument.arguments[1])
+        );
+    }
+
+    /**
+     * Returns whether a node is a basic string array wrapper function.
+     * @param node The AST node.
+     * @param stringArrayName The name of the string array function.
+     * @returns Whether or not the node matches a basic string array wrapping function
+     *          where there is an "Index Shift" but not any encoding/rc4 decryption
+     */
+    private isBasicStringArrayWrapperVariant(
+        node: t.Node,
+        stringArrayName: string
+    ) : node is t.FunctionDeclaration {
+
+        if (!t.isFunctionDeclaration(node)) return false;
+        const body = node.body.body;
+        const firstParam = node.params[0];
+        if (!t.isIdentifier(firstParam)) return false;
+        const firstParamName = firstParam.name;
+        
+        // Find the "Final Index" variable - index = index - literal
+        const hasIndexNormalization = body.some(stmt => {
+            // Not all statements have an 'expression' property (e.g. VariableDeclaration)
+            if (!t.isExpressionStatement(stmt)) return false;
+            if (!t.isAssignmentExpression(stmt.expression)) return false;
+            
+            const expr = stmt.expression;
+            if (!t.isIdentifier(expr.left, { name: firstParamName })) return false;
+            if (expr.operator !== '=') return false;
+
+            return (
+                t.isBinaryExpression(expr.right, { operator: '-' }) &&
+                t.isIdentifier(expr.right.left, { name: firstParamName }) &&
+                t.isNumericLiteral(expr.right.right)
+            );
+        });
+
+        if (!hasIndexNormalization) return false;
+
+        // Find usage of the Array Variable Name "stringArrayName"
+        let arrayVarName: string | null = null;
+        for (const stmt of body) {
+            if (t.isVariableDeclaration(stmt)) {
+                for (const decl of stmt.declarations) {
+                    if (
+                        t.isCallExpression(decl.init) && 
+                        t.isIdentifier(decl.init.callee, { name: stringArrayName }) &&
+                        t.isIdentifier(decl.id)
+                    ) {
+                        arrayVarName = decl.id.name;
+                        break;
+                    }
+                }
+            }
+            if (arrayVarName) break;
+        }
+
+        if (!arrayVarName) return false;
+
+        // Find the accessed/returned variable
+        let accessedVariable: string | null = null;
+        body.some(stmt => {
+            if (t.isVariableDeclaration(stmt)) {
+                return stmt.declarations.some(decl => {
+                    if (
+                        t.isMemberExpression(decl.init) &&
+                        t.isIdentifier(decl.init.object, { name: arrayVarName! }) &&
+                        t.isIdentifier(decl.init.property, { name: firstParamName }) &&
+                        t.isIdentifier(decl.id)
+                    ) {
+                        accessedVariable = decl.id.name;
+                        return true;
+                    }
+                    return false;
+                });
+            }
+            return false;
+        });
+
+        if (!accessedVariable) return false;
+
+        // Check that the return statement returns the variable we just found
+        return body.some(stmt => 
+            t.isReturnStatement(stmt) && 
+            t.isIdentifier(stmt.argument, { name: accessedVariable! })
         );
     }
 
